@@ -133,6 +133,16 @@ func (p *StateProcessor) Process(block *types.Block, statedb *state.StateDB, cfg
 // and uses the input parameters for its environment similar to ApplyTransaction. However,
 // this method takes an already created EVM instance as input.
 func ApplyTransactionWithEVM(msg *Message, gp *GasPool, statedb *state.StateDB, blockNumber *big.Int, blockHash common.Hash, tx *types.Transaction, usedGas *uint64, evm *vm.EVM) (receipt *types.Receipt, err error) {
+	// Initialize transaction timing metrics
+	timing := NewTransactionTiming(tx.Hash())
+	defer timing.Finalize()
+
+	// Set transaction hash in EVM config if tracer exists
+	txHash := tx.Hash()
+	if evm.Config.Tracer != nil {
+		evm.Config.Tracer.TxHash = &txHash
+	}
+
 	if hooks := evm.Config.Tracer; hooks != nil {
 		if hooks.OnTxStart != nil {
 			hooks.OnTxStart(evm.GetVMContext(), tx, msg.From)
@@ -141,12 +151,26 @@ func ApplyTransactionWithEVM(msg *Message, gp *GasPool, statedb *state.StateDB, 
 			defer func() { hooks.OnTxEnd(receipt, err) }()
 		}
 	}
+	
+	// Start measuring IO operations (state read/write)
+	timing.StartIOTimer()
+	// IO operations happen here during state lookups and preparations
+	
 	// Apply the transaction to the current state (included in the env).
+	timing.StopIOTimer()
+	
+	// Start measuring EVM execution time
+	timing.StartEVMExecutionTimer()
 	result, err := ApplyMessage(evm, msg, gp)
+	timing.StopEVMExecutionTimer()
+	
 	if err != nil {
 		return nil, err
 	}
+	
 	// Update the state with pending changes.
+	// Start IO timer as this involves disk operations
+	timing.StartIOTimer()
 	var root []byte
 	if evm.ChainConfig().IsByzantium(blockNumber) {
 		evm.StateDB.Finalise(true)
@@ -160,8 +184,12 @@ func ApplyTransactionWithEVM(msg *Message, gp *GasPool, statedb *state.StateDB, 
 	if statedb.GetTrie().IsVerkle() {
 		statedb.AccessEvents().Merge(evm.AccessEvents)
 	}
+	
+	// Create receipt - this is still IO work
+	receipt = MakeReceipt(evm, result, statedb, blockNumber, blockHash, tx, *usedGas, root)
+	timing.StopIOTimer()
 
-	return MakeReceipt(evm, result, statedb, blockNumber, blockHash, tx, *usedGas, root), nil
+	return receipt, nil
 }
 
 // MakeReceipt generates the receipt object for a transaction given its execution result.

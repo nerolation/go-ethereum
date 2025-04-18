@@ -215,6 +215,8 @@ type Hooks struct {
 	OnLog           LogHook
 	// Block hash read
 	OnBlockHashRead BlockHashReadHook
+	// Transaction information
+	TxHash *common.Hash
 }
 
 // BalanceChangeReason is used to indicate the reason for a balance change, useful

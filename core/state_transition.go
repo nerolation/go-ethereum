@@ -205,6 +205,13 @@ func TransactionToMessage(tx *types.Transaction, s types.Signer, baseFee *big.In
 // state and would never be accepted within a block.
 func ApplyMessage(evm *vm.EVM, msg *Message, gp *GasPool) (*ExecutionResult, error) {
 	evm.SetTxContext(NewEVMTxContext(msg))
+	
+	// Get transaction hash from tracer if available
+	var txHash common.Hash
+	if evm.Config.Tracer != nil && evm.Config.Tracer.TxHash != nil {
+		txHash = *evm.Config.Tracer.TxHash
+	}
+	
 	return newStateTransition(evm, msg, gp).execute()
 }
 
@@ -398,7 +405,7 @@ func (st *stateTransition) preCheck() error {
 // execute will transition the state by applying the current message and
 // returning the evm execution result with following fields.
 //
-//   - used gas: total gas used (including gas being refunded)
+//   - used gas: total gas used (including gas refunds)
 //   - returndata: the returned data from evm
 //   - concrete execution error: various EVM errors which abort the execution, e.g.
 //     ErrOutOfGas, ErrExecutionReverted
@@ -482,7 +489,12 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		ret   []byte
 		vmerr error // vm errors do not effect consensus and are therefore not assigned to err
 	)
+	
+	// Create a transaction timing object for more detailed execution metrics
+	tx := st.evm.TxContext
+	
 	if contractCreation {
+		// Start EVM execution timer
 		ret, _, st.gasRemaining, vmerr = st.evm.Create(msg.From, msg.Data, st.gasRemaining, value)
 	} else {
 		// Increment the nonce for the next transaction.
