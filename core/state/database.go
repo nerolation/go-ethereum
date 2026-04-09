@@ -260,19 +260,26 @@ func (db *CachingDB) ReaderEIP7928(stateRoot common.Hash, accessList map[common.
 			prefetchReader = nil // non-fatal: prefetch falls back to shared reader
 		}
 	}
-	// Set up a direct pathdb reader for the prefetch goroutines. This bypasses
-	// the geth cache/stats/multiStateReader layers for maximum parallelism while
-	// correctly reading through diff layers on mainnet. Falls back to the
-	// separate StateReader above for hash-scheme nodes where pathdb is unavailable.
+	// Set up fast-path readers for the prefetch goroutines. These bypass
+	// the geth cache/stats/multiStateReader layers for maximum parallelism.
+	//
+	// Priority:
+	//  1. rawDB: direct Pebble snapshot reads — when snapshotRoot == stateRoot
+	//  2. pathdbReader: direct pathdb reads — handles diff layers (mainnet)
+	//  3. prefetchReader (above): full StateReader — hash-scheme fallback
+	var rawDB ethdb.KeyValueReader
 	var pathdbReader database.StateReader
+	disk := db.triedb.Disk()
 	if len(accessList) > 0 {
-		if reader, err := db.triedb.StateReader(stateRoot); err == nil {
+		if rawdb.ReadSnapshotRoot(disk) == stateRoot {
+			rawDB = disk
+		} else if reader, err := db.triedb.StateReader(stateRoot); err == nil {
 			pathdbReader = reader
 		}
 	}
 
 	// Construct the state reader with background prefetching
-	pr := newPrefetchStateReader(r, prefetchReader, pathdbReader, accessList, threads)
+	pr := newPrefetchStateReader(r, prefetchReader, rawDB, pathdbReader, accessList, threads)
 
 	return newReader(db.codedb.Reader(), pr), nil
 }

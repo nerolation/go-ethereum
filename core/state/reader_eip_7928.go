@@ -66,9 +66,11 @@ import (
 	"sync"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/types/bal"
 	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/triedb/database"
 )
@@ -99,6 +101,7 @@ type prefetchResults struct {
 type prefetchStateReader struct {
 	StateReader                        // base reader for the main execution thread
 	prefetchReader StateReader         // dedicated reader for background prefetch (hash scheme fallback)
+	rawDB          ethdb.KeyValueReader // raw DB for direct snapshot reads (when snapshot root == state root)
 	pathdbReader   database.StateReader // pathdb reader for direct reads with diff layer support (mainnet)
 	results        *prefetchResults
 
@@ -112,10 +115,11 @@ type prefetchStateReader struct {
 // newPrefetchStateReader creates a prefetch reader that bypasses the geth reader
 // layers (cache, stats, multiStateReader) for maximum parallelism.
 //
-// Two read strategies are tried in order:
-//  1. pathdbReader: direct pathdb reads — correct with diff layers (mainnet path)
-//  2. prefetchReader: full separate StateReader — fallback for hash scheme
-func newPrefetchStateReader(reader StateReader, prefetchReader StateReader, pathdbReader database.StateReader, accessList bal.StorageKeys, nThreads int) *prefetchStateReader {
+// Three read strategies are tried in order:
+//  1. rawDB: direct Pebble snapshot reads — fastest, used when snapshotRoot == stateRoot
+//  2. pathdbReader: direct pathdb reads — correct with diff layers (mainnet path)
+//  3. prefetchReader: full separate StateReader — fallback for hash scheme
+func newPrefetchStateReader(reader StateReader, prefetchReader StateReader, rawDB ethdb.KeyValueReader, pathdbReader database.StateReader, accessList bal.StorageKeys, nThreads int) *prefetchStateReader {
 	tasks := make([]*fetchTask, 0, len(accessList))
 	for addr, slots := range accessList {
 		tasks = append(tasks, &fetchTask{
@@ -126,6 +130,7 @@ func newPrefetchStateReader(reader StateReader, prefetchReader StateReader, path
 	r := &prefetchStateReader{
 		StateReader:    reader,
 		prefetchReader: prefetchReader,
+		rawDB:          rawDB,
 		pathdbReader:   pathdbReader,
 		results:        &prefetchResults{},
 		tasks:          tasks,
@@ -268,9 +273,21 @@ func (r *prefetchStateReader) prefetchAccount(addr common.Address) {
 	}
 	addrHash := crypto.Keccak256Hash(addr[:])
 
-	// Direct pathdb read — bypasses geth wrapper layers, correct with diff layers.
-	if r.pathdbReader != nil {
-		slim, err := r.pathdbReader.Account(addrHash)
+	// Try direct reads (rawDB or pathdb), both return SlimAccount-encoded bytes.
+	var slim *types.SlimAccount
+	if r.rawDB != nil {
+		data := rawdb.ReadAccountSnapshot(r.rawDB, addrHash)
+		if data == nil {
+			r.results.accounts.Store(addr, (*types.StateAccount)(nil))
+			return
+		}
+		slim = new(types.SlimAccount)
+		if err := rlp.DecodeBytes(data, slim); err != nil {
+			return // skip; main thread retries via base reader
+		}
+	} else if r.pathdbReader != nil {
+		var err error
+		slim, err = r.pathdbReader.Account(addrHash)
 		if err != nil {
 			return // skip; main thread retries via base reader
 		}
@@ -278,32 +295,33 @@ func (r *prefetchStateReader) prefetchAccount(addr common.Address) {
 			r.results.accounts.Store(addr, (*types.StateAccount)(nil))
 			return
 		}
-		// Convert SlimAccount → StateAccount (same logic as flatReader).
-		acct := &types.StateAccount{
-			Nonce:   slim.Nonce,
-			Balance: slim.Balance,
-			Root:    common.BytesToHash(slim.Root),
+	} else {
+		// Hash-scheme fallback: use the dedicated or shared reader.
+		reader := r.StateReader
+		if r.prefetchReader != nil {
+			reader = r.prefetchReader
 		}
-		if len(slim.CodeHash) > 0 {
-			acct.CodeHash = slim.CodeHash
-		} else {
-			acct.CodeHash = types.EmptyCodeHash.Bytes()
+		acct, err := reader.Account(addr)
+		if err == nil {
+			r.results.accounts.Store(addr, acct)
 		}
-		if acct.Root == (common.Hash{}) {
-			acct.Root = types.EmptyRootHash
-		}
-		r.results.accounts.Store(addr, acct)
 		return
 	}
-	// Hash-scheme fallback: use the dedicated or shared reader.
-	reader := r.StateReader
-	if r.prefetchReader != nil {
-		reader = r.prefetchReader
+	// Convert SlimAccount → StateAccount (same logic as flatReader).
+	acct := &types.StateAccount{
+		Nonce:   slim.Nonce,
+		Balance: slim.Balance,
+		Root:    common.BytesToHash(slim.Root),
 	}
-	acct, err := reader.Account(addr)
-	if err == nil {
-		r.results.accounts.Store(addr, acct)
+	if len(slim.CodeHash) > 0 {
+		acct.CodeHash = slim.CodeHash
+	} else {
+		acct.CodeHash = types.EmptyCodeHash.Bytes()
 	}
+	if acct.Root == (common.Hash{}) {
+		acct.Root = types.EmptyRootHash
+	}
+	r.results.accounts.Store(addr, acct)
 }
 
 // prefetchStorage reads a storage slot and stores the result for the main thread.
@@ -317,35 +335,40 @@ func (r *prefetchStateReader) prefetchStorage(addr common.Address, slot common.H
 	addrHash := crypto.Keccak256Hash(addr[:])
 	slotHash := crypto.Keccak256Hash(slot[:])
 
-	// Direct pathdb read — bypasses geth wrapper layers, correct with diff layers.
-	if r.pathdbReader != nil {
-		data, err := r.pathdbReader.Storage(addrHash, slotHash)
+	// Try direct reads (rawDB or pathdb), both return RLP-encoded bytes.
+	var data []byte
+	if r.rawDB != nil {
+		data = rawdb.ReadStorageSnapshot(r.rawDB, addrHash, slotHash)
+	} else if r.pathdbReader != nil {
+		var err error
+		data, err = r.pathdbReader.Storage(addrHash, slotHash)
 		if err != nil {
 			return // skip; main thread retries via base reader
 		}
-		// Decode RLP storage value (same logic as flatReader).
-		if len(data) == 0 {
-			r.results.storages.Store(storageKey{addr, slot}, common.Hash{})
-			return
+	} else {
+		// Hash-scheme fallback: use the dedicated or shared reader.
+		reader := r.StateReader
+		if r.prefetchReader != nil {
+			reader = r.prefetchReader
 		}
-		_, content, _, err := rlp.Split(data)
-		if err != nil {
-			return // skip; main thread retries via base reader
+		val, err := reader.Storage(addr, slot)
+		if err == nil {
+			r.results.storages.Store(storageKey{addr, slot}, val)
 		}
-		var value common.Hash
-		value.SetBytes(content)
-		r.results.storages.Store(storageKey{addr, slot}, value)
 		return
 	}
-	// Hash-scheme fallback: use the dedicated or shared reader.
-	reader := r.StateReader
-	if r.prefetchReader != nil {
-		reader = r.prefetchReader
+	// Decode RLP storage value (same logic as flatReader).
+	if len(data) == 0 {
+		r.results.storages.Store(storageKey{addr, slot}, common.Hash{})
+		return
 	}
-	val, err := reader.Storage(addr, slot)
-	if err == nil {
-		r.results.storages.Store(storageKey{addr, slot}, val)
+	_, content, _, err := rlp.Split(data)
+	if err != nil {
+		return // skip; main thread retries via base reader
 	}
+	var value common.Hash
+	value.SetBytes(content)
+	r.results.storages.Store(storageKey{addr, slot}, value)
 }
 
 // ReaderWithBlockLevelAccessList provides state access that reflects the
