@@ -32,7 +32,6 @@ import (
 	"github.com/ethereum/go-ethereum/trie/transitiontrie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/triedb"
-	"github.com/ethereum/go-ethereum/triedb/database"
 )
 
 // Database wraps access to tries and contract code.
@@ -250,36 +249,13 @@ func (db *CachingDB) ReaderEIP7928(stateRoot common.Hash, accessList map[common.
 	// Construct the state reader with native cache and associated statistics
 	r := newStateReaderWithStats(newStateReaderWithCache(base))
 
-	// Create a dedicated reader for prefetch goroutines. This separate
-	// instance avoids lock contention between the background prefetch
-	// workers and the main execution thread on the shared cache layer.
-	var prefetchReader StateReader
-	if len(accessList) > 0 {
-		prefetchReader, err = db.StateReader(stateRoot)
-		if err != nil {
-			prefetchReader = nil // non-fatal: prefetch falls back to shared reader
-		}
-	}
-	// Set up fast-path readers for the prefetch goroutines. These bypass
-	// the geth cache/stats/multiStateReader layers for maximum parallelism.
-	//
-	// Priority:
-	//  1. rawDB: direct Pebble snapshot reads — when snapshotRoot == stateRoot
-	//  2. pathdbReader: direct pathdb reads — handles diff layers (mainnet)
-	//  3. prefetchReader (above): full StateReader — hash-scheme fallback
-	var rawDB ethdb.KeyValueReader
-	var pathdbReader database.StateReader
-	disk := db.triedb.Disk()
-	if len(accessList) > 0 {
-		if rawdb.ReadSnapshotRoot(disk) == stateRoot {
-			rawDB = disk
-		} else if reader, err := db.triedb.StateReader(stateRoot); err == nil {
-			pathdbReader = reader
-		}
-	}
-
-	// Construct the state reader with background prefetching
-	pr := newPrefetchStateReader(r, prefetchReader, rawDB, pathdbReader, accessList, threads)
+	// Construct the state reader with background prefetching.
+	// The prefetch goroutines issue parallel raw Pebble Gets to warm the
+	// block cache. When the EVM later reads the same slots through the
+	// normal reader stack, the Pebble Gets are block-cache hits instead
+	// of SSD reads. This is always correct because execution uses the
+	// unchanged reader stack (pathdb diff layers, caches, etc.).
+	pr := newPrefetchStateReader(r, db.triedb.Disk(), accessList, threads)
 
 	return newReader(db.codedb.Reader(), pr), nil
 }
