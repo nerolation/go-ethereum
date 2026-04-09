@@ -249,8 +249,29 @@ func (db *CachingDB) ReaderEIP7928(stateRoot common.Hash, accessList map[common.
 	// Construct the state reader with native cache and associated statistics
 	r := newStateReaderWithStats(newStateReaderWithCache(base))
 
+	// Create a dedicated reader for prefetch goroutines. This separate
+	// instance avoids lock contention between the background prefetch
+	// workers and the main execution thread on the shared cache layer.
+	var prefetchReader StateReader
+	if len(accessList) > 0 {
+		prefetchReader, err = db.StateReader(stateRoot)
+		if err != nil {
+			prefetchReader = nil // non-fatal: prefetch falls back to shared reader
+		}
+	}
+	// When the requested state root matches the snapshot (disk layer) root,
+	// prefetch goroutines can read directly from the snapshot layer in Pebble,
+	// bypassing all intermediate reader layers for maximum parallel throughput.
+	// When they differ (diff layers exist between disk and HEAD), we must read
+	// through the pathdb reader to pick up recent state changes correctly.
+	var rawDB ethdb.KeyValueReader
+	disk := db.triedb.Disk()
+	if len(accessList) > 0 && rawdb.ReadSnapshotRoot(disk) == stateRoot {
+		rawDB = disk
+	}
+
 	// Construct the state reader with background prefetching
-	pr := newPrefetchStateReader(r, accessList, threads)
+	pr := newPrefetchStateReader(r, prefetchReader, rawDB, accessList, threads)
 
 	return newReader(db.codedb.Reader(), pr), nil
 }

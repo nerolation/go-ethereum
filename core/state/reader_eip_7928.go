@@ -65,11 +65,13 @@ package state
 import (
 	"sync"
 
-	"github.com/ethereum/go-ethereum/crypto"
-
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/types/bal"
+	"github.com/ethereum/go-ethereum/crypto"
+	"github.com/ethereum/go-ethereum/ethdb"
+	"github.com/ethereum/go-ethereum/rlp"
 )
 
 type fetchTask struct {
@@ -79,8 +81,28 @@ type fetchTask struct {
 
 func (t *fetchTask) weight() int { return 1 + len(t.slots) }
 
+// storageKey is a composite key for prefetch result lookups.
+// Using a fixed-size struct avoids heap allocations for map keys.
+type storageKey struct {
+	addr common.Address
+	slot common.Hash
+}
+
+// prefetchResults stores data fetched by background prefetch goroutines.
+// It uses sync.Map which is optimized for the write-once/read-once pattern:
+// prefetch workers write each entry exactly once, the main thread reads it
+// at most once.
+type prefetchResults struct {
+	accounts sync.Map // common.Address → *types.StateAccount (typed nil = non-existent)
+	storages sync.Map // storageKey → common.Hash
+}
+
 type prefetchStateReader struct {
-	StateReader
+	StateReader                    // base reader for the main execution thread
+	prefetchReader StateReader     // dedicated reader for background prefetch (nil = use StateReader)
+	rawDB          ethdb.KeyValueReader // raw DB for direct snapshot reads (fastest path)
+	results        *prefetchResults
+
 	tasks     []*fetchTask
 	nThreads  int
 	done      chan struct{}
@@ -88,7 +110,11 @@ type prefetchStateReader struct {
 	closeOnce sync.Once
 }
 
-func newPrefetchStateReader(reader StateReader, accessList bal.StorageKeys, nThreads int) *prefetchStateReader {
+// newPrefetchStateReader creates a prefetch reader that reads directly from the
+// raw snapshot layer in Pebble, bypassing all intermediate geth reader layers
+// (cache, stats, pathdb, trie) for maximum parallelism. The rawDB handle is
+// used for direct Pebble Gets; prefetchReader is the fallback if rawDB is nil.
+func newPrefetchStateReader(reader StateReader, prefetchReader StateReader, rawDB ethdb.KeyValueReader, accessList bal.StorageKeys, nThreads int) *prefetchStateReader {
 	tasks := make([]*fetchTask, 0, len(accessList))
 	for addr, slots := range accessList {
 		tasks = append(tasks, &fetchTask{
@@ -96,9 +122,22 @@ func newPrefetchStateReader(reader StateReader, accessList bal.StorageKeys, nThr
 			slots: slots,
 		})
 	}
-	return newPrefetchStateReaderInternal(reader, tasks, nThreads)
+	r := &prefetchStateReader{
+		StateReader:    reader,
+		prefetchReader: prefetchReader,
+		rawDB:          rawDB,
+		results:        &prefetchResults{},
+		tasks:          tasks,
+		nThreads:       nThreads,
+		done:           make(chan struct{}),
+		term:           make(chan struct{}),
+	}
+	go r.prefetch()
+	return r
 }
 
+// newPrefetchStateReaderInternal creates a prefetch reader that shares the base
+// reader with the prefetch goroutines (legacy behavior, used by tests).
 func newPrefetchStateReaderInternal(reader StateReader, tasks []*fetchTask, nThreads int) *prefetchStateReader {
 	r := &prefetchStateReader{
 		StateReader: reader,
@@ -109,6 +148,30 @@ func newPrefetchStateReaderInternal(reader StateReader, tasks []*fetchTask, nThr
 	}
 	go r.prefetch()
 	return r
+}
+
+// Account checks the prefetch result store first. If the item was
+// prefetched, it returns immediately without touching the base reader.
+// Otherwise it falls through to the base reader (cold path).
+func (r *prefetchStateReader) Account(addr common.Address) (*types.StateAccount, error) {
+	if r.results != nil {
+		if val, ok := r.results.accounts.Load(addr); ok {
+			return val.(*types.StateAccount), nil
+		}
+	}
+	return r.StateReader.Account(addr)
+}
+
+// Storage checks the prefetch result store first. If the item was
+// prefetched, it returns immediately without touching the base reader.
+// Otherwise it falls through to the base reader (cold path).
+func (r *prefetchStateReader) Storage(addr common.Address, slot common.Hash) (common.Hash, error) {
+	if r.results != nil {
+		if val, ok := r.results.storages.Load(storageKey{addr, slot}); ok {
+			return val.(common.Hash), nil
+		}
+	}
+	return r.StateReader.Storage(addr, slot)
 }
 
 func (r *prefetchStateReader) Close() {
@@ -180,9 +243,9 @@ func (r *prefetchStateReader) process(start, limit int) {
 					return
 				default:
 					if j == 0 {
-						r.StateReader.Account(t.addr)
+						r.prefetchAccount(t.addr)
 					} else {
-						r.StateReader.Storage(t.addr, t.slots[j-1])
+						r.prefetchStorage(t.addr, t.slots[j-1])
 					}
 				}
 			}
@@ -191,6 +254,81 @@ func (r *prefetchStateReader) process(start, limit int) {
 		if total >= limit {
 			return
 		}
+	}
+}
+
+// prefetchAccount reads an account and stores the result for the main thread.
+// When rawDB is available, it reads directly from the snapshot layer in Pebble,
+// bypassing all geth reader layers for maximum throughput.
+func (r *prefetchStateReader) prefetchAccount(addr common.Address) {
+	// Fast path: direct snapshot read from Pebble.
+	if r.rawDB != nil && r.results != nil {
+		addrHash := crypto.Keccak256Hash(addr[:])
+		data := rawdb.ReadAccountSnapshot(r.rawDB, addrHash)
+		if data == nil {
+			r.results.accounts.Store(addr, (*types.StateAccount)(nil))
+			return
+		}
+		var slim types.SlimAccount
+		if err := rlp.DecodeBytes(data, &slim); err != nil {
+			return // skip on error; main thread will retry via base reader
+		}
+		acct := &types.StateAccount{
+			Nonce:   slim.Nonce,
+			Balance: slim.Balance,
+			Root:    common.BytesToHash(slim.Root),
+		}
+		if len(slim.CodeHash) > 0 {
+			acct.CodeHash = slim.CodeHash
+		} else {
+			acct.CodeHash = types.EmptyCodeHash.Bytes()
+		}
+		if acct.Root == (common.Hash{}) {
+			acct.Root = types.EmptyRootHash
+		}
+		r.results.accounts.Store(addr, acct)
+		return
+	}
+	// Fallback: use the dedicated prefetch reader or the shared base reader.
+	reader := r.StateReader
+	if r.prefetchReader != nil {
+		reader = r.prefetchReader
+	}
+	acct, err := reader.Account(addr)
+	if err == nil && r.results != nil {
+		r.results.accounts.Store(addr, acct)
+	}
+}
+
+// prefetchStorage reads a storage slot and stores the result for the main thread.
+// When rawDB is available, it reads directly from the snapshot layer in Pebble.
+func (r *prefetchStateReader) prefetchStorage(addr common.Address, slot common.Hash) {
+	// Fast path: direct snapshot read from Pebble.
+	if r.rawDB != nil && r.results != nil {
+		addrHash := crypto.Keccak256Hash(addr[:])
+		slotHash := crypto.Keccak256Hash(slot[:])
+		data := rawdb.ReadStorageSnapshot(r.rawDB, addrHash, slotHash)
+		if len(data) == 0 {
+			r.results.storages.Store(storageKey{addr, slot}, common.Hash{})
+			return
+		}
+		_, content, _, err := rlp.Split(data)
+		if err != nil {
+			return // skip on error; main thread will retry via base reader
+		}
+		var value common.Hash
+		value.SetBytes(content)
+		r.results.storages.Store(storageKey{addr, slot}, value)
+		return
+	}
+	// Fallback: use the dedicated prefetch reader or the shared base reader.
+	reader := r.StateReader
+	if r.prefetchReader != nil {
+		reader = r.prefetchReader
+	}
+	val, err := reader.Storage(addr, slot)
+	if err == nil && r.results != nil {
+		r.results.storages.Store(storageKey{addr, slot}, val)
 	}
 }
 
