@@ -32,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/trie/transitiontrie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/triedb"
+	"github.com/ethereum/go-ethereum/triedb/database"
 )
 
 // Database wraps access to tries and contract code.
@@ -259,19 +260,26 @@ func (db *CachingDB) ReaderEIP7928(stateRoot common.Hash, accessList map[common.
 			prefetchReader = nil // non-fatal: prefetch falls back to shared reader
 		}
 	}
-	// When the requested state root matches the snapshot (disk layer) root,
-	// prefetch goroutines can read directly from the snapshot layer in Pebble,
-	// bypassing all intermediate reader layers for maximum parallel throughput.
-	// When they differ (diff layers exist between disk and HEAD), we must read
-	// through the pathdb reader to pick up recent state changes correctly.
+	// Set up fast-path readers for the prefetch goroutines. These bypass
+	// the geth cache/stats/multiStateReader layers for maximum parallelism.
+	//
+	// Priority:
+	//  1. rawDB: direct Pebble snapshot reads — when snapshotRoot == stateRoot
+	//  2. pathdbReader: direct pathdb reads — handles diff layers (mainnet)
+	//  3. prefetchReader (above): full StateReader — hash-scheme fallback
 	var rawDB ethdb.KeyValueReader
+	var pathdbReader database.StateReader
 	disk := db.triedb.Disk()
-	if len(accessList) > 0 && rawdb.ReadSnapshotRoot(disk) == stateRoot {
-		rawDB = disk
+	if len(accessList) > 0 {
+		if rawdb.ReadSnapshotRoot(disk) == stateRoot {
+			rawDB = disk
+		} else if reader, err := db.triedb.StateReader(stateRoot); err == nil {
+			pathdbReader = reader
+		}
 	}
 
 	// Construct the state reader with background prefetching
-	pr := newPrefetchStateReader(r, prefetchReader, rawDB, accessList, threads)
+	pr := newPrefetchStateReader(r, prefetchReader, rawDB, pathdbReader, accessList, threads)
 
 	return newReader(db.codedb.Reader(), pr), nil
 }
