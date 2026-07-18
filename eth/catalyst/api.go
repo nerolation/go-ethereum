@@ -387,15 +387,15 @@ func (api *ConsensusAPI) forkchoiceUpdated(ctx context.Context, update engine.Fo
 	// will replace it arbitrarily many times in between.
 	if payloadAttributes != nil {
 		args := &miner.BuildPayloadArgs{
-			Parent:       update.HeadBlockHash,
-			Timestamp:    payloadAttributes.Timestamp,
-			FeeRecipient: payloadAttributes.SuggestedFeeRecipient,
-			Random:       payloadAttributes.Random,
-			Withdrawals:  payloadAttributes.Withdrawals,
-			BeaconRoot:   payloadAttributes.BeaconRoot,
-			SlotNum:      payloadAttributes.SlotNumber,
-			TargetGasLimit:    payloadAttributes.TargetGasLimit,
-			Version:      payloadVersion,
+			Parent:         update.HeadBlockHash,
+			Timestamp:      payloadAttributes.Timestamp,
+			FeeRecipient:   payloadAttributes.SuggestedFeeRecipient,
+			Random:         payloadAttributes.Random,
+			Withdrawals:    payloadAttributes.Withdrawals,
+			BeaconRoot:     payloadAttributes.BeaconRoot,
+			SlotNum:        payloadAttributes.SlotNumber,
+			TargetGasLimit: payloadAttributes.TargetGasLimit,
+			Version:        payloadVersion,
 		}
 		id := args.Id()
 		// If we already are busy generating this work, then we do not need
@@ -1323,10 +1323,13 @@ func getBodyV2(block *types.Block) *engine.ExecutionPayloadBodyV2 {
 	if body == nil {
 		return nil
 	}
-	return &engine.ExecutionPayloadBodyV2{
-		ExecutionPayloadBody: *body,
-		BlockAccessList:      block.AccessList(),
+	result := &engine.ExecutionPayloadBodyV2{ExecutionPayloadBody: *body}
+	if al := block.AccessList(); al != nil {
+		if encoded, err := rlp.EncodeToBytes(al); err == nil {
+			result.BlockAccessList = (*hexutil.Bytes)(&encoded)
+		}
 	}
+	return result
 }
 
 // convertRequests converts a hex requests slice to plain [][]byte.

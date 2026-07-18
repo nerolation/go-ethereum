@@ -35,6 +35,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/forkid"
+	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
@@ -695,6 +696,26 @@ func (api *BlockChainAPI) GetBlockReceipts(ctx context.Context, blockNrOrHash rp
 		result[i] = MarshalReceipt(receipt, block.Hash(), block.NumberU64(), signer, txs[i], i)
 	}
 	return result, nil
+}
+
+// GetBlockAccessList returns the EIP-7928 block access list for the given block
+// hash or number or tag.
+func (api *BlockChainAPI) GetBlockAccessList(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) ([]*RPCAccountAccess, error) {
+	if blockNr, ok := blockNrOrHash.Number(); ok && blockNr == rpc.PendingBlockNumber {
+		return nil, nil
+	}
+	block, err := api.b.BlockByNumberOrHash(ctx, blockNrOrHash)
+	if block == nil || err != nil {
+		return nil, err
+	}
+	if !api.b.ChainConfig().IsAmsterdam(block.Number(), block.Time()) {
+		return nil, &resourceNotFoundError{message: "Resource not found"}
+	}
+	list := block.AccessList()
+	if list == nil {
+		return nil, &history.PrunedHistoryError{}
+	}
+	return marshalBlockAccessList(list), nil
 }
 
 // ChainContextBackend provides methods required to implement ChainContext.
@@ -2059,6 +2080,23 @@ func (api *DebugAPI) GetRawBlock(ctx context.Context, blockNrOrHash rpc.BlockNum
 		return nil, fmt.Errorf("block #%d not found", hash)
 	}
 	return rlp.EncodeToBytes(block)
+}
+
+// GetRawBlockAccessList retrieves the RLP-encoded EIP-7928 block access list
+// of a single block.
+func (api *DebugAPI) GetRawBlockAccessList(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) (hexutil.Bytes, error) {
+	block, err := api.b.BlockByNumberOrHash(ctx, blockNrOrHash)
+	if err != nil {
+		return nil, err
+	}
+	if block == nil || !api.b.ChainConfig().IsAmsterdam(block.Number(), block.Time()) {
+		return nil, &resourceNotFoundError{message: "Resource not found"}
+	}
+	list := block.AccessList()
+	if list == nil {
+		return nil, &history.PrunedHistoryError{}
+	}
+	return rlp.EncodeToBytes(list)
 }
 
 // GetRawReceipts retrieves the binary-encoded receipts of a single block.

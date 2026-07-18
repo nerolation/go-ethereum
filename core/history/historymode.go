@@ -143,5 +143,5 @@ func NewPolicy(mode HistoryMode, genesisHash common.Hash) (HistoryPolicy, error)
 // PrunedHistoryError is returned by APIs when the requested history is pruned.
 type PrunedHistoryError struct{}
 
-func (e *PrunedHistoryError) Error() string  { return "pruned history unavailable" }
+func (e *PrunedHistoryError) Error() string  { return "Pruned history unavailable" }
 func (e *PrunedHistoryError) ErrorCode() int { return 4444 }

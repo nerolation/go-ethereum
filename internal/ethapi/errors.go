@@ -114,6 +114,7 @@ const (
 	errCodeInternalError           = -32603
 	errCodeInvalidParams           = -32602
 	errCodeVMError                 = -32015
+	errCodeResourceNotFound        = -32001
 	errCodeTxSyncTimeout           = 4
 )
 
@@ -150,6 +151,11 @@ func txValidationError(err error) *invalidTxError {
 		Code:    errCodeInternalError,
 	}
 }
+
+type resourceNotFoundError struct{ message string }
+
+func (e *resourceNotFoundError) Error() string  { return e.message }
+func (e *resourceNotFoundError) ErrorCode() int { return errCodeResourceNotFound }
 
 type invalidParamsError struct{ message string }
 
