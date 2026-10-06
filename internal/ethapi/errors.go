@@ -113,6 +113,7 @@ const (
 	errCodeClientLimitExceeded     = -38026
 	errCodeInternalError           = -32603
 	errCodeInvalidParams           = -32602
+	errCodeResourceNotFound        = -32001
 	errCodeVMError                 = -32015
 	errCodeTxSyncTimeout           = 4
 )
@@ -155,6 +156,11 @@ type invalidParamsError struct{ message string }
 
 func (e *invalidParamsError) Error() string  { return e.message }
 func (e *invalidParamsError) ErrorCode() int { return errCodeInvalidParams }
+
+type resourceNotFoundError struct{ message string }
+
+func (e *resourceNotFoundError) Error() string  { return e.message }
+func (e *resourceNotFoundError) ErrorCode() int { return errCodeResourceNotFound }
 
 type clientLimitExceededError struct{ message string }
 

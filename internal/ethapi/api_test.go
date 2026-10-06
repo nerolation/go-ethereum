@@ -44,6 +44,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/filtermaps"
+	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -3857,6 +3858,111 @@ func TestRPCGetBlockReceipts(t *testing.T) {
 			continue
 		}
 		testRPCResponseWithFile(t, i, result, "eth_getBlockReceipts", tt.file)
+	}
+}
+
+func TestRPCGetBlockAccessList(t *testing.T) {
+	t.Parallel()
+
+	var (
+		acc1Key, _ = crypto.HexToECDSA("8a1f9a8f95be41cd7ccb6168179afb4504aefe388d1e14474d32c45c72ce7b7a")
+		acc2Key, _ = crypto.HexToECDSA("49a7b37aa6f6645917e7b807e9d1c00d4fa71f18343b0d4122a4d2df64dd6fee")
+		acc1Addr   = crypto.PubkeyToAddress(acc1Key.PublicKey)
+		acc2Addr   = crypto.PubkeyToAddress(acc2Key.PublicKey)
+		config     = *params.MergedTestChainConfig
+		genesis    = &core.Genesis{
+			Config:     &config,
+			Difficulty: common.Big0,
+			Alloc: types.GenesisAlloc{
+				acc1Addr: {Balance: big.NewInt(params.Ether)},
+				acc2Addr: {Balance: big.NewInt(params.Ether)},
+			},
+		}
+		genBlocks     = 5
+		amsterdamTime = uint64(30) // generated blocks are 10 seconds apart, block 3 is the first Amsterdam block
+		signer        = types.LatestSigner(&config)
+	)
+	config.AmsterdamTime = &amsterdamTime
+	backend := newTestBackend(t, genBlocks, genesis, beacon.New(ethash.NewFaker()), func(i int, b *core.BlockGen) {
+		b.SetPoS()
+		tx, _ := types.SignTx(types.NewTx(&types.LegacyTx{Nonce: uint64(i), To: &acc2Addr, Value: big.NewInt(1000), Gas: params.TxGas, GasPrice: b.BaseFee()}), signer, acc1Key)
+		b.AddTx(tx)
+	})
+	api := NewBlockChainAPI(backend)
+	ctx := context.Background()
+
+	blockHashes := make([]common.Hash, genBlocks+1)
+	for i := 0; i <= genBlocks; i++ {
+		header, err := backend.HeaderByNumber(ctx, rpc.BlockNumber(i))
+		if err != nil {
+			t.Fatalf("failed to get block %d: %v", i, err)
+		}
+		blockHashes[i] = header.Hash()
+	}
+	// Block 4 is an Amsterdam block whose access list has been pruned.
+	rawdb.DeleteAccessList(backend.db, blockHashes[4], 4)
+
+	var testSuite = []struct {
+		test    rpc.BlockNumberOrHash
+		file    string
+		errCode int
+	}{
+		// 0. amsterdam block by number
+		{
+			test: rpc.BlockNumberOrHashWithNumber(3),
+			file: "number-3",
+		},
+		// 1. amsterdam block by hash
+		{
+			test: rpc.BlockNumberOrHashWithHash(blockHashes[3], false),
+			file: "hash-3",
+		},
+		// 2. latest tag
+		{
+			test: rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber),
+			file: "tag-latest",
+		},
+		// 3. pending tag
+		{
+			test: rpc.BlockNumberOrHashWithNumber(rpc.PendingBlockNumber),
+			file: "tag-pending",
+		},
+		// 4. unknown block number
+		{
+			test: rpc.BlockNumberOrHashWithNumber(rpc.BlockNumber(genBlocks + 1)),
+			file: "number-notfound",
+		},
+		// 5. unknown block hash
+		{
+			test: rpc.BlockNumberOrHashWithHash(common.Hash{1}, false),
+			file: "hash-notfound",
+		},
+		// 6. pre-amsterdam block
+		{
+			test:    rpc.BlockNumberOrHashWithNumber(2),
+			errCode: errCodeResourceNotFound,
+		},
+		// 7. pruned access list
+		{
+			test:    rpc.BlockNumberOrHashWithHash(blockHashes[4], false),
+			errCode: (&history.PrunedHistoryError{}).ErrorCode(),
+		},
+	}
+
+	for i, tt := range testSuite {
+		result, err := api.GetBlockAccessList(ctx, tt.test)
+		if tt.errCode != 0 {
+			var rpcErr rpc.Error
+			if !errors.As(err, &rpcErr) || rpcErr.ErrorCode() != tt.errCode {
+				t.Errorf("test %d: want error code %d, have %v", i, tt.errCode, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("test %d: want no error, have %v", i, err)
+			continue
+		}
+		testRPCResponseWithFile(t, i, result, "eth_getBlockAccessList", tt.file)
 	}
 }
 

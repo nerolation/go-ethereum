@@ -35,8 +35,11 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/forkid"
+	"github.com/ethereum/go-ethereum/core/history"
+	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/types/bal"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/gasestimator"
@@ -699,6 +702,122 @@ func (api *BlockChainAPI) GetBlockReceipts(ctx context.Context, blockNrOrHash rp
 		result[i] = MarshalReceipt(receipt, block.Hash(), block.NumberU64(), signer, txs[i], i)
 	}
 	return result, nil
+}
+
+// GetBlockAccessList returns the EIP-7928 block access list of the given block.
+// Per the specification, the result is null for unknown blocks and the pending
+// tag, blocks before Amsterdam are reported as resource not found and blocks
+// whose access list is no longer stored as pruned history.
+func (api *BlockChainAPI) GetBlockAccessList(ctx context.Context, blockNrOrHash rpc.BlockNumberOrHash) ([]*RPCAccountAccess, error) {
+	if number, ok := blockNrOrHash.Number(); ok && number == rpc.PendingBlockNumber {
+		return nil, nil
+	}
+	block, err := api.b.BlockByNumberOrHash(ctx, blockNrOrHash)
+	if block == nil || err != nil {
+		return nil, err
+	}
+	if !api.b.ChainConfig().IsAmsterdam(block.Number(), block.Time()) {
+		return nil, &resourceNotFoundError{"block access list not available before amsterdam"}
+	}
+	list := rawdb.ReadAccessList(api.b.ChainDb(), block.Hash(), block.NumberU64())
+	if list == nil {
+		return nil, &history.PrunedHistoryError{}
+	}
+	return newRPCBlockAccessList(list), nil
+}
+
+// RPCAccountAccess is the eth_getBlockAccessList representation of the changes
+// recorded for one account, following the execution-apis BlockAccessList schema.
+type RPCAccountAccess struct {
+	Address        common.Address     `json:"address"`
+	StorageChanges []RPCSlotChanges   `json:"storageChanges"`
+	StorageReads   []common.Hash      `json:"storageReads"`
+	BalanceChanges []RPCBalanceChange `json:"balanceChanges"`
+	NonceChanges   []RPCNonceChange   `json:"nonceChanges"`
+	CodeChanges    []RPCCodeChange    `json:"codeChanges"`
+}
+
+// RPCSlotChanges lists the writes to a single storage slot.
+type RPCSlotChanges struct {
+	Key     common.Hash        `json:"key"`
+	Changes []RPCStorageChange `json:"changes"`
+}
+
+// RPCStorageChange is the post-state value of a slot at a block access index.
+type RPCStorageChange struct {
+	Index hexutil.Uint64 `json:"index"`
+	Value common.Hash    `json:"value"`
+}
+
+// RPCBalanceChange is the post-state balance at a block access index.
+type RPCBalanceChange struct {
+	Index hexutil.Uint64 `json:"index"`
+	Value *hexutil.U256  `json:"value"`
+}
+
+// RPCNonceChange is the post-state nonce at a block access index.
+type RPCNonceChange struct {
+	Index hexutil.Uint64 `json:"index"`
+	Value hexutil.Uint64 `json:"value"`
+}
+
+// RPCCodeChange is the post-state code at a block access index.
+type RPCCodeChange struct {
+	Index hexutil.Uint64 `json:"index"`
+	Code  hexutil.Bytes  `json:"code"`
+}
+
+// newRPCBlockAccessList converts a decoded block access list into its RPC
+// representation, keeping the canonical ordering and emitting empty arrays
+// for absent change lists.
+func newRPCBlockAccessList(list *bal.BlockAccessList) []*RPCAccountAccess {
+	result := make([]*RPCAccountAccess, 0, len(*list))
+	for _, account := range *list {
+		entry := &RPCAccountAccess{
+			Address:        account.Address,
+			StorageChanges: make([]RPCSlotChanges, 0, len(account.StorageChanges)),
+			StorageReads:   make([]common.Hash, 0, len(account.StorageReads)),
+			BalanceChanges: make([]RPCBalanceChange, 0, len(account.BalanceChanges)),
+			NonceChanges:   make([]RPCNonceChange, 0, len(account.NonceChanges)),
+			CodeChanges:    make([]RPCCodeChange, 0, len(account.CodeChanges)),
+		}
+		for _, slot := range account.StorageChanges {
+			changes := make([]RPCStorageChange, 0, len(slot.SlotChanges))
+			for _, write := range slot.SlotChanges {
+				changes = append(changes, RPCStorageChange{
+					Index: hexutil.Uint64(write.BlockAccessIndex),
+					Value: write.PostValue.Bytes32(),
+				})
+			}
+			entry.StorageChanges = append(entry.StorageChanges, RPCSlotChanges{
+				Key:     slot.Slot.Bytes32(),
+				Changes: changes,
+			})
+		}
+		for _, key := range account.StorageReads {
+			entry.StorageReads = append(entry.StorageReads, key.Bytes32())
+		}
+		for _, change := range account.BalanceChanges {
+			entry.BalanceChanges = append(entry.BalanceChanges, RPCBalanceChange{
+				Index: hexutil.Uint64(change.BlockAccessIndex),
+				Value: (*hexutil.U256)(change.PostBalance),
+			})
+		}
+		for _, change := range account.NonceChanges {
+			entry.NonceChanges = append(entry.NonceChanges, RPCNonceChange{
+				Index: hexutil.Uint64(change.BlockAccessIndex),
+				Value: hexutil.Uint64(change.PostNonce),
+			})
+		}
+		for _, change := range account.CodeChanges {
+			entry.CodeChanges = append(entry.CodeChanges, RPCCodeChange{
+				Index: hexutil.Uint64(change.BlockAccessIndex),
+				Code:  change.NewCode,
+			})
+		}
+		result = append(result, entry)
+	}
+	return result
 }
 
 // ChainContextBackend provides methods required to implement ChainContext.
