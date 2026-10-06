@@ -194,6 +194,8 @@ func (api *ConsensusAPI) NewPayloadWithWitnessV4(ctx context.Context, params eng
 // and returns a stateless witness after running the payload.
 func (api *ConsensusAPI) NewPayloadWithWitnessV5(ctx context.Context, params engine.ExecutableData, versionedHashes []common.Hash, beaconRoot *common.Hash, executionRequests []hexutil.Bytes) (engine.PayloadStatusV1, error) {
 	switch {
+	case !api.checkFork(params.Timestamp, forks.Amsterdam, forks.BPO3, forks.BPO4, forks.BPO5, forks.Bogota):
+		return invalidStatus, unsupportedForkErr("newPayloadV5 must only be called for amsterdam payloads")
 	case params.Withdrawals == nil:
 		return invalidStatus, paramsErr("nil withdrawals post-shanghai")
 	case params.ExcessBlobGas == nil:
@@ -210,8 +212,6 @@ func (api *ConsensusAPI) NewPayloadWithWitnessV5(ctx context.Context, params eng
 		return invalidStatus, paramsErr("nil block access list post-amsterdam")
 	case params.SlotNumber == nil:
 		return invalidStatus, paramsErr("nil slotnumber post-amsterdam")
-	case !api.checkFork(params.Timestamp, forks.Amsterdam, forks.BPO3, forks.BPO4, forks.BPO5, forks.Bogota):
-		return invalidStatus, unsupportedForkErr("newPayloadV5 must only be called for amsterdam payloads")
 	}
 	requests := convertRequests(executionRequests)
 	if err := validateRequests(requests); err != nil {

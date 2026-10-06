@@ -863,6 +863,8 @@ func (api *ConsensusAPI) NewPayloadV4(ctx context.Context, params engine.Executa
 // NewPayloadV5 creates an Eth1 block, inserts it in the chain, and returns the status of the chain.
 func (api *ConsensusAPI) NewPayloadV5(ctx context.Context, params engine.ExecutableData, versionedHashes []common.Hash, beaconRoot *common.Hash, executionRequests []hexutil.Bytes) (engine.PayloadStatusV1, error) {
 	switch {
+	case !api.checkFork(params.Timestamp, forks.Amsterdam, forks.BPO3, forks.BPO4, forks.BPO5, forks.Bogota):
+		return invalidStatus, unsupportedForkErr("newPayloadV5 must only be called for amsterdam payloads")
 	case params.Withdrawals == nil:
 		return invalidStatus, paramsErr("nil withdrawals post-shanghai")
 	case params.ExcessBlobGas == nil:
@@ -883,8 +885,6 @@ func (api *ConsensusAPI) NewPayloadV5(ctx context.Context, params engine.Executa
 		// is present but does not decode (including the empty byte string) is
 		// not a params error, the payload is rejected as INVALID further down.
 		return invalidStatus, paramsErr("missing block access list post-amsterdam")
-	case !api.checkFork(params.Timestamp, forks.Amsterdam, forks.BPO3, forks.BPO4, forks.BPO5, forks.Bogota):
-		return invalidStatus, unsupportedForkErr("newPayloadV5 must only be called for amsterdam payloads")
 	}
 	requests := convertRequests(executionRequests)
 	if err := validateRequests(requests); err != nil {
